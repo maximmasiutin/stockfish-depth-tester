@@ -12,12 +12,12 @@ Usage:
     python measure_depth_at_tc.py
     python measure_depth_at_tc.py --exe ./stockfish
 
-  Run custom TC:
+  Run custom TC (one or more):
     python measure_depth_at_tc.py --tc 10+0.1 --threads 1
-    python measure_depth_at_tc.py --tc 20+0.2 --threads 8
+    python measure_depth_at_tc.py --tc 5+0.05 20+0.2 60+0.6 --threads 8
 
   Use opening book positions:
-    python measure_depth_at_tc.py --tc 120+1 --threads 8 --book book.epd -n 20
+    python measure_depth_at_tc.py --tc 120+1 --threads 8 --book book.epd -n 30 --seed 1
 
   Save output:
     python measure_depth_at_tc.py -o results.txt
@@ -43,6 +43,7 @@ import re
 import statistics
 import subprocess
 import sys
+import time
 from typing import Any
 
 DEFAULT_EXE = "stockfish.exe" if sys.platform == "win32" else "./stockfish"
@@ -81,18 +82,19 @@ AVG_MOVES = 60
 
 def load_book_positions(
     path: str, n: int, seed: int | None = None
-) -> list[Position]:
-    """Load n random positions from an EPD file."""
+) -> tuple[list[Position], list[int]]:
+    """Load n random positions from an EPD file. Returns (positions, line_numbers)."""
     try:
         with open(path, encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
+            all_lines = [(i + 1, line.strip()) for i, line in enumerate(f) if line.strip()]
     except FileNotFoundError:
         print(f"Error: book file not found: {path}", file=sys.stderr)
         sys.exit(1)
     rng = random.Random(seed)
-    selected = rng.sample(lines, min(n, len(lines)))
+    selected = rng.sample(all_lines, min(n, len(all_lines)))
     positions: list[Position] = []
-    for epd_line in selected:
+    line_numbers: list[int] = []
+    for line_num, epd_line in selected:
         # EPD has 4 FEN fields (board, side, castling, ep) then opcodes.
         # Full FEN has 6 fields (adding halfmove clock and fullmove number).
         fields = epd_line.split()
@@ -102,63 +104,72 @@ def load_book_positions(
             fen = " ".join(fields[:4]) + " 0 1"
         else:
             fen = epd_line
-        positions.append((fen, fen))
-    return positions
+        positions.append((f"line {line_num}", fen))
+        line_numbers.append(line_num)
+    return positions, line_numbers
 
 
-def _parse_depths(output: str) -> tuple[list[int], list[int]]:
-    """Extract final depth and seldepth per position from engine output."""
-    depths: list[int] = []
-    seldepths: list[int] = []
+
+def _run_single_position(
+    exe: str, fen: str, threads: int, movetime_ms: int
+) -> tuple[int, int]:
+    """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
+    timeout_s = max(30, movetime_ms // 1000 * 5)
+    try:
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+    except FileNotFoundError:
+        return 0, 0
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    proc.stdin.write("uci\n")
+    proc.stdin.write(f"setoption name Threads value {threads}\n")
+    proc.stdin.write("setoption name Hash value 256\n")
+    proc.stdin.write("isready\n")
+    proc.stdin.write(f"position fen {fen}\n")
+    proc.stdin.write(f"go movetime {movetime_ms}\n")
+    proc.stdin.flush()
     last_depth = 0
     last_seldepth = 0
-    found = False
-    for line in output.splitlines():
+    deadline = time.time() + timeout_s
+    for line in proc.stdout:
+        if time.time() > deadline:
+            break
+        line = line.strip()
         m = re.search(r"info depth (\d+) seldepth (\d+) .*score", line)
         if m:
             last_depth = int(m.group(1))
             last_seldepth = int(m.group(2))
-            found = True
-        elif line.startswith("bestmove") and found:
-            depths.append(last_depth)
-            seldepths.append(last_seldepth)
-            found = False
-    return depths, seldepths
+        if line.startswith("bestmove"):
+            break
+    try:
+        proc.stdin.write("quit\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    return last_depth, last_seldepth
 
 
 def run_config(
     exe: str, cfg: Config, positions: list[Position]
 ) -> tuple[list[int], list[int], int]:
-    """Run Stockfish on positions with given config, return depths and seldepths."""
+    """Run Stockfish on each position in a separate process."""
     total_time = cfg["base"] + AVG_MOVES * cfg["inc"]
     movetime_ms = int(total_time / AVG_MOVES * 1000)
     threads: int = cfg["threads"]
 
-    parts = [
-        "uci",
-        f"setoption name Threads value {threads}",
-        "setoption name Hash value 256",
-        "isready",
-    ]
+    depths: list[int] = []
+    seldepths: list[int] = []
     for _label, fen in positions:
-        parts.append(f"position fen {fen}")
-        parts.append(f"go movetime {movetime_ms}")
-    parts.append("quit")
-    commands = "\n".join(parts) + "\n"
-
-    timeout_s = max(600, len(positions) * movetime_ms // 1000 * 3)
-    try:
-        result = subprocess.run(
-            [exe], input=commands, capture_output=True,
-            text=True, timeout=timeout_s, check=False)
-    except FileNotFoundError:
-        print(f"Error: executable not found: {exe}", file=sys.stderr)
-        return [], [], movetime_ms
-    except subprocess.TimeoutExpired:
-        print(f"Error: timeout after {timeout_s}s", file=sys.stderr)
-        return [], [], movetime_ms
-
-    depths, seldepths = _parse_depths(result.stdout + result.stderr)
+        d, sd = _run_single_position(exe, fen, threads, movetime_ms)
+        depths.append(d)
+        seldepths.append(sd)
     return depths, seldepths, movetime_ms
 
 
@@ -220,27 +231,16 @@ def print_results(all_results: list[ResultDict | None]) -> None:
         print()
 
     # Summary table
-    print("=== Summary: Median Depth ===")
+    print("=== Summary: Mean Depth ===")
     print(f"  {'TC':<30} {'Depth':>8} {'SelDepth':>11}")
     print(f"  {'-' * 30} {'-' * 8} {'-' * 11}")
     for r in all_results:
         if r is None:
             continue
-        print(f"  {r['label']:<30} {r['depth_median']:>8.1f} {r['seldepth_median']:>11.1f}")
+        print(f"  {r['label']:<30} {r['depth_mean']:>8.1f} {r['seldepth_mean']:>11.1f}")
     print()
 
 
-def save_txt(all_results: list[ResultDict | None], path: str) -> None:
-    """Save formatted results to a text file."""
-    buf = io.StringIO()
-    old_stdout = sys.stdout
-    sys.stdout = buf
-    try:
-        print_results(all_results)
-    finally:
-        sys.stdout = old_stdout
-    with open(path, "w", newline="\n", encoding="utf-8") as f:
-        f.write(buf.getvalue())
 
 
 def save_csv(all_results: list[ResultDict | None], path: str) -> None:
@@ -285,7 +285,61 @@ def parse_tc(tc_str: str) -> tuple[float, float]:
     return base, inc
 
 
-def _save_output(all_results: list[ResultDict | None], path: str) -> None:
+def _build_configs(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> list[Config]:
+    """Build config list from parsed arguments."""
+    if args.tc:
+        if args.threads is None:
+            parser.error("--threads is required when using --tc")
+        if args.threads <= 0:
+            parser.error("--threads must be a positive integer")
+        configs: list[Config] = []
+        for tc_str in args.tc:
+            try:
+                base, inc = parse_tc(tc_str)
+            except ValueError as e:
+                parser.error(str(e))
+            configs.append({"label": f"TC {tc_str}, {args.threads}T",
+                            "threads": args.threads, "base": base, "inc": inc})
+        return configs
+    return STANDARD_CONFIGS
+
+
+def _capture_full_output(
+    args: argparse.Namespace, pos_desc: str,
+    book_line_numbers: list[int], all_results: list[ResultDict | None]
+) -> str:
+    """Reproduce all console output as a string for saving."""
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        print(f"Executable: {args.exe}")
+        print(f"Positions: {pos_desc}")
+        if args.seed is not None:
+            print(f"Seed: {args.seed}")
+        if book_line_numbers:
+            print(f"Book lines: {', '.join(str(n) for n in book_line_numbers)}")
+        print(f"Assumed average game length: {AVG_MOVES} moves")
+        print()
+        for r in all_results:
+            if r is None:
+                print("NO DATA")
+            else:
+                print(f"Running {r['label']} ...")
+                print(f"  median depth={r['depth_median']:.1f}, "
+                      f"seldepth={r['seldepth_median']:.1f}")
+        print()
+        print_results(all_results)
+    finally:
+        sys.stdout = old_stdout
+    return buf.getvalue()
+
+
+def _save_output(
+    all_results: list[ResultDict | None], path: str, full_log: str
+) -> None:
     """Save results to file, format auto-detected from extension."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
@@ -293,7 +347,8 @@ def _save_output(all_results: list[ResultDict | None], path: str) -> None:
     elif ext == ".json":
         save_json(all_results, path)
     else:
-        save_txt(all_results, path)
+        with open(path, "w", newline="\n", encoding="utf-8") as f:
+            f.write(full_log)
     print(f"Saved to {path}")
 
 
@@ -305,8 +360,8 @@ def main() -> None:
         epilog=__doc__)
     parser.add_argument("--exe", default=DEFAULT_EXE,
                         help=f"Path to stockfish executable (default: {DEFAULT_EXE})")
-    parser.add_argument("--tc", type=str, default=None,
-                        help="Custom TC as base+inc, e.g. 10+0.1 (overrides standard TCs)")
+    parser.add_argument("--tc", type=str, nargs="+", default=None,
+                        help="One or more TCs as base+inc, e.g. 5+0.05 20+0.2 60+0.6")
     parser.add_argument("--threads", type=int, default=None,
                         help="Thread count for custom TC (required with --tc)")
     parser.add_argument("--book", type=str, default=None,
@@ -323,30 +378,23 @@ def main() -> None:
         parser.error("--num-positions must be at least 1")
 
     positions: list[Position]
+    book_line_numbers: list[int] = []
     if args.book:
-        positions = load_book_positions(args.book, args.num_positions, args.seed)
+        positions, book_line_numbers = load_book_positions(
+            args.book, args.num_positions, args.seed)
         pos_desc = f"{len(positions)} positions from {os.path.basename(args.book)}"
     else:
         positions = BUILTIN_POSITIONS
         pos_desc = f"{len(positions)} built-in positions"
 
-    configs: list[Config]
-    if args.tc:
-        if args.threads is None:
-            parser.error("--threads is required when using --tc")
-        if args.threads <= 0:
-            parser.error("--threads must be a positive integer")
-        try:
-            base, inc = parse_tc(args.tc)
-        except ValueError as e:
-            parser.error(str(e))
-        configs = [{"label": f"TC {args.tc}, {args.threads}T",
-                     "threads": args.threads, "base": base, "inc": inc}]
-    else:
-        configs = STANDARD_CONFIGS
+    configs = _build_configs(parser, args)
 
     print(f"Executable: {args.exe}")
     print(f"Positions: {pos_desc}")
+    if args.seed is not None:
+        print(f"Seed: {args.seed}")
+    if book_line_numbers:
+        print(f"Book lines: {', '.join(str(n) for n in book_line_numbers)}")
     print(f"Assumed average game length: {AVG_MOVES} moves")
     print()
 
@@ -366,7 +414,8 @@ def main() -> None:
     print_results(all_results)
 
     if args.output:
-        _save_output(all_results, args.output)
+        _save_output(all_results, args.output, _capture_full_output(
+            args, pos_desc, book_line_numbers, all_results))
 
 
 if __name__ == "__main__":
