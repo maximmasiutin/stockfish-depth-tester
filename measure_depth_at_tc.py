@@ -42,6 +42,7 @@ import os
 import platform
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -166,6 +167,9 @@ def load_book_positions(
 
 def _validate_engine(exe: str) -> None:
     """Check that the engine executable exists and responds to UCI."""
+    if not shutil.which(exe):
+        print(f"Error: engine not found: {exe}", file=sys.stderr)
+        sys.exit(1)
     try:
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
