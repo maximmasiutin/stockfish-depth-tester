@@ -15,6 +15,7 @@ Usage:
   Run custom TC (one or more):
     python measure_depth_at_tc.py --tc 10+0.1 --threads 1
     python measure_depth_at_tc.py --tc 5+0.05 20+0.2 60+0.6 --threads 8
+    python measure_depth_at_tc.py --tc 10+0.1  (threads default to min(CPU count, 8))
 
   Use opening book positions:
     python measure_depth_at_tc.py --tc 120+1 --threads 8 --book book.epd -n 30 --seed 1
@@ -35,11 +36,14 @@ Method:
 
 import argparse
 import csv
+import functools
 import io
 import json
 import os
+import platform
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -78,6 +82,61 @@ STANDARD_CONFIGS: list[Config] = [
 ]
 
 AVG_MOVES = 60
+MAX_DEFAULT_THREADS = 8
+
+
+def _detect_cpu_name() -> str:
+    """Detect CPU model name using OS-specific methods."""
+    system = platform.system()
+    if system == "Windows":
+        # platform.processor() on Windows returns description like
+        # "Intel64 Family 6 Model 85 Stepping 7, GenuineIntel".
+        # Try WMI via wmic for a friendlier name.
+        try:
+            result = subprocess.run(
+                ["wmic", "cpu", "get", "name"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line and line.lower() != "name":
+                    return line
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        except OSError:
+            pass
+    elif system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            name = result.stdout.strip()
+            if name:
+                return name
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    return platform.processor() or "Unknown CPU"
+
+
+@functools.lru_cache(maxsize=1)
+def get_cpu_info() -> tuple[str, int]:
+    """Detect CPU model name and available thread count.
+
+    Returns (cpu_name, available_threads). Works on Windows, Linux, and macOS.
+    Falls back to platform.processor() if OS-specific detection fails.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        available_threads = len(os.sched_getaffinity(0))
+    else:
+        available_threads = os.cpu_count() or 1
+    return _detect_cpu_name(), available_threads
 
 
 def load_book_positions(
@@ -110,6 +169,43 @@ def load_book_positions(
 
 
 
+def _validate_engine(exe: str) -> None:
+    """Check that the engine executable exists and responds to UCI."""
+    if not shutil.which(exe):
+        if os.path.isfile(exe):
+            print(f"Error: engine is not executable: {exe}", file=sys.stderr)
+        else:
+            print(f"Error: engine not found: {exe}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with subprocess.Popen(
+            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+        ) as proc:
+            if proc.stdin is None or proc.stdout is None:
+                print(f"Error: cannot connect to engine stdio: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
+            try:
+                stdout, _ = proc.communicate(input="uci\nquit\n", timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                print(f"Error: engine timed out during UCI handshake: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
+            if "uciok" not in stdout:
+                print(f"Error: engine did not respond to UCI: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
+    except FileNotFoundError:
+        print(f"Error: engine not found: {exe}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: cannot start engine: {exe}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _run_single_position(
     exe: str, fen: str, threads: int, movetime_ms: int
 ) -> tuple[int, int]:
@@ -119,10 +215,14 @@ def _run_single_position(
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True)
-    except FileNotFoundError:
-        return 0, 0
-    assert proc.stdin is not None
-    assert proc.stdout is not None
+    except OSError as e:
+        print(f"Error: cannot start engine: {exe}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if proc.stdin is None or proc.stdout is None:
+        print(f"Error: cannot connect to engine stdio: {exe}", file=sys.stderr)
+        proc.kill()
+        proc.wait()
+        sys.exit(1)
     proc.stdin.write("uci\n")
     proc.stdin.write(f"setoption name Threads value {threads}\n")
     proc.stdin.write("setoption name Hash value 256\n")
@@ -285,30 +385,56 @@ def parse_tc(tc_str: str) -> tuple[float, float]:
     return base, inc
 
 
+def _default_threads() -> int:
+    """Return default thread count: min(available CPUs, MAX_DEFAULT_THREADS)."""
+    _, available = get_cpu_info()
+    return min(available, MAX_DEFAULT_THREADS)
+
+
 def _build_configs(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[Config]:
     """Build config list from parsed arguments."""
-    if args.tc:
-        if args.threads is None:
-            parser.error("--threads is required when using --tc")
+    _, available = get_cpu_info()
+    if args.threads is not None:
         if args.threads <= 0:
             parser.error("--threads must be a positive integer")
+        if args.threads > available:
+            parser.error(
+                f"--threads {args.threads} exceeds available CPUs ({available})")
+    if args.tc:
+        threads: int = args.threads if args.threads is not None else _default_threads()
         configs: list[Config] = []
         for tc_str in args.tc:
             try:
                 base, inc = parse_tc(tc_str)
             except ValueError as e:
                 parser.error(str(e))
-            configs.append({"label": f"TC {tc_str}, {args.threads}T",
-                            "threads": args.threads, "base": base, "inc": inc})
+            configs.append({"label": f"TC {tc_str}, {threads}T",
+                            "threads": threads, "base": base, "inc": inc})
         return configs
-    return STANDARD_CONFIGS
+    # Standard configs: cap SMP thread counts at available CPUs
+    default_t = args.threads if args.threads is not None else _default_threads()
+    capped: list[Config] = []
+    for cfg in STANDARD_CONFIGS:
+        t = min(cfg["threads"], default_t)
+        label = re.sub(r"\d+T\)", f"{t}T)", cfg["label"])
+        capped.append({**cfg, "threads": t, "label": label})
+    return capped
+
+
+def _format_hardware_line(threads_used: int) -> str:
+    """Format the hardware info line for display."""
+    cpu_name, available_threads = get_cpu_info()
+    return (f"Hardware: {cpu_name}. "
+            f"The test used {threads_used} thread{'s' if threads_used != 1 else ''} "
+            f"out of {available_threads} available on that CPU")
 
 
 def _capture_full_output(
     args: argparse.Namespace, pos_desc: str,
-    book_line_numbers: list[int], all_results: list[ResultDict | None]
+    book_line_numbers: list[int], all_results: list[ResultDict | None],
+    max_threads_used: int,
 ) -> str:
     """Reproduce all console output as a string for saving."""
     buf = io.StringIO()
@@ -316,6 +442,7 @@ def _capture_full_output(
     sys.stdout = buf
     try:
         print(f"Executable: {args.exe}")
+        print(_format_hardware_line(max_threads_used))
         print(f"Positions: {pos_desc}")
         if args.seed is not None:
             print(f"Seed: {args.seed}")
@@ -363,7 +490,7 @@ def main() -> None:
     parser.add_argument("--tc", type=str, nargs="+", default=None,
                         help="One or more TCs as base+inc, e.g. 5+0.05 20+0.2 60+0.6")
     parser.add_argument("--threads", type=int, default=None,
-                        help="Thread count for custom TC (required with --tc)")
+                        help="Thread count (default: min(CPU count, 8))")
     parser.add_argument("--book", type=str, default=None,
                         help="EPD file with opening positions (random sample)")
     parser.add_argument("-n", "--num-positions", type=int, default=20,
@@ -389,7 +516,12 @@ def main() -> None:
 
     configs = _build_configs(parser, args)
 
+    _validate_engine(args.exe)
+
+    max_threads_used = max(cfg["threads"] for cfg in configs)
+
     print(f"Executable: {args.exe}")
+    print(_format_hardware_line(max_threads_used))
     print(f"Positions: {pos_desc}")
     if args.seed is not None:
         print(f"Seed: {args.seed}")
@@ -415,7 +547,7 @@ def main() -> None:
 
     if args.output:
         _save_output(all_results, args.output, _capture_full_output(
-            args, pos_desc, book_line_numbers, all_results))
+            args, pos_desc, book_line_numbers, all_results, max_threads_used))
 
 
 if __name__ == "__main__":
