@@ -15,6 +15,7 @@ Usage:
   Run custom TC (one or more):
     python measure_depth_at_tc.py --tc 10+0.1 --threads 1
     python measure_depth_at_tc.py --tc 5+0.05 20+0.2 60+0.6 --threads 8
+    python measure_depth_at_tc.py --tc 10+0.1  (threads default to min(CPU count, 8))
 
   Use opening book positions:
     python measure_depth_at_tc.py --tc 120+1 --threads 8 --book book.epd -n 30 --seed 1
@@ -81,6 +82,7 @@ STANDARD_CONFIGS: list[Config] = [
 ]
 
 AVG_MOVES = 60
+MAX_DEFAULT_THREADS = 8
 
 
 @functools.lru_cache(maxsize=1)
@@ -382,25 +384,41 @@ def parse_tc(tc_str: str) -> tuple[float, float]:
     return base, inc
 
 
+def _default_threads() -> int:
+    """Return default thread count: min(available CPUs, MAX_DEFAULT_THREADS)."""
+    return min(os.cpu_count() or 1, MAX_DEFAULT_THREADS)
+
+
 def _build_configs(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[Config]:
     """Build config list from parsed arguments."""
-    if args.tc:
-        if args.threads is None:
-            parser.error("--threads is required when using --tc")
+    available = os.cpu_count() or 1
+    if args.threads is not None:
         if args.threads <= 0:
             parser.error("--threads must be a positive integer")
+        if args.threads > available:
+            parser.error(
+                f"--threads {args.threads} exceeds available CPUs ({available})")
+    if args.tc:
+        threads: int = args.threads if args.threads is not None else _default_threads()
         configs: list[Config] = []
         for tc_str in args.tc:
             try:
                 base, inc = parse_tc(tc_str)
             except ValueError as e:
                 parser.error(str(e))
-            configs.append({"label": f"TC {tc_str}, {args.threads}T",
-                            "threads": args.threads, "base": base, "inc": inc})
+            configs.append({"label": f"TC {tc_str}, {threads}T",
+                            "threads": threads, "base": base, "inc": inc})
         return configs
-    return STANDARD_CONFIGS
+    # Standard configs: cap SMP thread counts at available CPUs
+    default_t = _default_threads()
+    capped: list[Config] = []
+    for cfg in STANDARD_CONFIGS:
+        t = min(cfg["threads"], default_t)
+        label = re.sub(r"\d+T\)", f"{t}T)", cfg["label"])
+        capped.append({**cfg, "threads": t, "label": label})
+    return capped
 
 
 def _format_hardware_line(threads_used: int) -> str:
@@ -470,7 +488,7 @@ def main() -> None:
     parser.add_argument("--tc", type=str, nargs="+", default=None,
                         help="One or more TCs as base+inc, e.g. 5+0.05 20+0.2 60+0.6")
     parser.add_argument("--threads", type=int, default=None,
-                        help="Thread count for custom TC (required with --tc)")
+                        help="Thread count (default: min(CPU count, 8))")
     parser.add_argument("--book", type=str, default=None,
                         help="EPD file with opening positions (random sample)")
     parser.add_argument("-n", "--num-positions", type=int, default=20,
