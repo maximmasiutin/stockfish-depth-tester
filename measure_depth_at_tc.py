@@ -164,17 +164,56 @@ def load_book_positions(
 
 
 
-def _run_single_position(
-    exe: str, fen: str, threads: int, movetime_ms: int
-) -> tuple[int, int]:
-    """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
-    timeout_s = max(30, movetime_ms // 1000 * 5)
+def _validate_engine(exe: str) -> None:
+    """Check that the engine executable exists and responds to UCI."""
     try:
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True)
     except FileNotFoundError:
-        return 0, 0
+        print(f"Error: engine not found: {exe}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: cannot start engine: {exe}: {e}", file=sys.stderr)
+        sys.exit(1)
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        proc.stdin.write("uci\n")
+        proc.stdin.flush()
+        deadline = time.time() + 10
+        got_uciok = False
+        for line in proc.stdout:
+            if time.time() > deadline:
+                break
+            if line.strip() == "uciok":
+                got_uciok = True
+                break
+        if not got_uciok:
+            print(f"Error: engine did not respond to UCI: {exe}",
+                  file=sys.stderr)
+            sys.exit(1)
+    finally:
+        try:
+            proc.stdin.write("quit\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _run_single_position(
+    exe: str, fen: str, threads: int, movetime_ms: int
+) -> tuple[int, int]:
+    """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
+    timeout_s = max(30, movetime_ms // 1000 * 5)
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True)
     assert proc.stdin is not None
     assert proc.stdout is not None
     proc.stdin.write("uci\n")
@@ -452,6 +491,8 @@ def main() -> None:
         pos_desc = f"{len(positions)} built-in positions"
 
     configs = _build_configs(parser, args)
+
+    _validate_engine(args.exe)
 
     max_threads_used = max(cfg["threads"] for cfg in configs)
 
