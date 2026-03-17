@@ -172,7 +172,10 @@ def load_book_positions(
 def _validate_engine(exe: str) -> None:
     """Check that the engine executable exists and responds to UCI."""
     if not shutil.which(exe):
-        print(f"Error: engine not found: {exe}", file=sys.stderr)
+        if os.path.isfile(exe):
+            print(f"Error: engine is not executable: {exe}", file=sys.stderr)
+        else:
+            print(f"Error: engine not found: {exe}", file=sys.stderr)
         sys.exit(1)
     try:
         with subprocess.Popen(
@@ -384,14 +387,15 @@ def parse_tc(tc_str: str) -> tuple[float, float]:
 
 def _default_threads() -> int:
     """Return default thread count: min(available CPUs, MAX_DEFAULT_THREADS)."""
-    return min(os.cpu_count() or 1, MAX_DEFAULT_THREADS)
+    _, available = get_cpu_info()
+    return min(available, MAX_DEFAULT_THREADS)
 
 
 def _build_configs(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> list[Config]:
     """Build config list from parsed arguments."""
-    available = os.cpu_count() or 1
+    _, available = get_cpu_info()
     if args.threads is not None:
         if args.threads <= 0:
             parser.error("--threads must be a positive integer")
@@ -410,7 +414,7 @@ def _build_configs(
                             "threads": threads, "base": base, "inc": inc})
         return configs
     # Standard configs: cap SMP thread counts at available CPUs
-    default_t = _default_threads()
+    default_t = args.threads if args.threads is not None else _default_threads()
     capped: list[Config] = []
     for cfg in STANDARD_CONFIGS:
         t = min(cfg["threads"], default_t)
