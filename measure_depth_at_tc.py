@@ -35,9 +35,11 @@ Method:
 
 import argparse
 import csv
+import functools
 import io
 import json
 import os
+import platform
 import random
 import re
 import statistics
@@ -78,6 +80,58 @@ STANDARD_CONFIGS: list[Config] = [
 ]
 
 AVG_MOVES = 60
+
+
+@functools.lru_cache(maxsize=1)
+def get_cpu_info() -> tuple[str, int]:
+    """Detect CPU model name and available thread count.
+
+    Returns (cpu_name, available_threads). Works on Windows, Linux, and macOS.
+    Falls back to platform.processor() if OS-specific detection fails.
+    """
+    available_threads = os.cpu_count() or 1
+    cpu_name = ""
+
+    system = platform.system()
+    if system == "Windows":
+        # platform.processor() on Windows returns description like
+        # "Intel64 Family 6 Model 85 Stepping 7, GenuineIntel".
+        # Try WMI via wmic for a friendlier name.
+        try:
+            result = subprocess.run(
+                ["wmic", "cpu", "get", "name"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for line in result.stdout.strip().splitlines():
+                line = line.strip()
+                if line and line.lower() != "name":
+                    cpu_name = line
+                    break
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+    elif system == "Linux":
+        try:
+            with open("/proc/cpuinfo", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        cpu_name = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+    elif system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            cpu_name = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
+    if not cpu_name:
+        cpu_name = platform.processor() or "Unknown CPU"
+
+    return cpu_name, available_threads
 
 
 def load_book_positions(
@@ -306,9 +360,18 @@ def _build_configs(
     return STANDARD_CONFIGS
 
 
+def _format_hardware_line(threads_used: int) -> str:
+    """Format the hardware info line for display."""
+    cpu_name, available_threads = get_cpu_info()
+    return (f"Hardware: {cpu_name}. "
+            f"The test used {threads_used} thread{'s' if threads_used != 1 else ''} "
+            f"out of {available_threads} available on that CPU")
+
+
 def _capture_full_output(
     args: argparse.Namespace, pos_desc: str,
-    book_line_numbers: list[int], all_results: list[ResultDict | None]
+    book_line_numbers: list[int], all_results: list[ResultDict | None],
+    max_threads_used: int,
 ) -> str:
     """Reproduce all console output as a string for saving."""
     buf = io.StringIO()
@@ -316,6 +379,7 @@ def _capture_full_output(
     sys.stdout = buf
     try:
         print(f"Executable: {args.exe}")
+        print(_format_hardware_line(max_threads_used))
         print(f"Positions: {pos_desc}")
         if args.seed is not None:
             print(f"Seed: {args.seed}")
@@ -389,7 +453,10 @@ def main() -> None:
 
     configs = _build_configs(parser, args)
 
+    max_threads_used = max(cfg["threads"] for cfg in configs)
+
     print(f"Executable: {args.exe}")
+    print(_format_hardware_line(max_threads_used))
     print(f"Positions: {pos_desc}")
     if args.seed is not None:
         print(f"Seed: {args.seed}")
@@ -415,7 +482,7 @@ def main() -> None:
 
     if args.output:
         _save_output(all_results, args.output, _capture_full_output(
-            args, pos_desc, book_line_numbers, all_results))
+            args, pos_desc, book_line_numbers, all_results, max_threads_used))
 
 
 if __name__ == "__main__":
