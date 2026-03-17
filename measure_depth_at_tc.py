@@ -85,16 +85,8 @@ AVG_MOVES = 60
 MAX_DEFAULT_THREADS = 8
 
 
-@functools.lru_cache(maxsize=1)
-def get_cpu_info() -> tuple[str, int]:
-    """Detect CPU model name and available thread count.
-
-    Returns (cpu_name, available_threads). Works on Windows, Linux, and macOS.
-    Falls back to platform.processor() if OS-specific detection fails.
-    """
-    available_threads = os.cpu_count() or 1
-    cpu_name = ""
-
+def _detect_cpu_name() -> str:
+    """Detect CPU model name using OS-specific methods."""
     system = platform.system()
     if system == "Windows":
         # platform.processor() on Windows returns description like
@@ -108,8 +100,7 @@ def get_cpu_info() -> tuple[str, int]:
             for line in result.stdout.strip().splitlines():
                 line = line.strip()
                 if line and line.lower() != "name":
-                    cpu_name = line
-                    break
+                    return line
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
     elif system == "Linux":
@@ -117,8 +108,7 @@ def get_cpu_info() -> tuple[str, int]:
             with open("/proc/cpuinfo", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("model name"):
-                        cpu_name = line.split(":", 1)[1].strip()
-                        break
+                        return line.split(":", 1)[1].strip()
         except OSError:
             pass
     elif system == "Darwin":
@@ -127,14 +117,26 @@ def get_cpu_info() -> tuple[str, int]:
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
                 capture_output=True, text=True, timeout=5, check=False,
             )
-            cpu_name = result.stdout.strip()
+            name = result.stdout.strip()
+            if name:
+                return name
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
+    return platform.processor() or "Unknown CPU"
 
-    if not cpu_name:
-        cpu_name = platform.processor() or "Unknown CPU"
 
-    return cpu_name, available_threads
+@functools.lru_cache(maxsize=1)
+def get_cpu_info() -> tuple[str, int]:
+    """Detect CPU model name and available thread count.
+
+    Returns (cpu_name, available_threads). Works on Windows, Linux, and macOS.
+    Falls back to platform.processor() if OS-specific detection fails.
+    """
+    if hasattr(os, "sched_getaffinity"):
+        available_threads = len(os.sched_getaffinity(0))
+    else:
+        available_threads = os.cpu_count() or 1
+    return _detect_cpu_name(), available_threads
 
 
 def load_book_positions(
@@ -173,43 +175,32 @@ def _validate_engine(exe: str) -> None:
         print(f"Error: engine not found: {exe}", file=sys.stderr)
         sys.exit(1)
     try:
-        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        with subprocess.Popen(
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True)
+            stderr=subprocess.STDOUT, text=True,
+        ) as proc:
+            if proc.stdin is None or proc.stdout is None:
+                print(f"Error: cannot connect to engine stdio: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
+            try:
+                stdout, _ = proc.communicate(input="uci\nquit\n", timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                print(f"Error: engine timed out during UCI handshake: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
+            if "uciok" not in stdout:
+                print(f"Error: engine did not respond to UCI: {exe}",
+                      file=sys.stderr)
+                sys.exit(1)
     except FileNotFoundError:
         print(f"Error: engine not found: {exe}", file=sys.stderr)
         sys.exit(1)
     except OSError as e:
         print(f"Error: cannot start engine: {exe}: {e}", file=sys.stderr)
         sys.exit(1)
-    assert proc.stdin is not None
-    assert proc.stdout is not None
-    try:
-        proc.stdin.write("uci\n")
-        proc.stdin.flush()
-        deadline = time.time() + 10
-        got_uciok = False
-        for line in proc.stdout:
-            if time.time() > deadline:
-                break
-            if line.strip() == "uciok":
-                got_uciok = True
-                break
-        if not got_uciok:
-            print(f"Error: engine did not respond to UCI: {exe}",
-                  file=sys.stderr)
-            sys.exit(1)
-    finally:
-        try:
-            proc.stdin.write("quit\n")
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
 
 
 def _run_single_position(
@@ -217,11 +208,18 @@ def _run_single_position(
 ) -> tuple[int, int]:
     """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
     timeout_s = max(30, movetime_ms // 1000 * 5)
-    proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True)
-    assert proc.stdin is not None
-    assert proc.stdout is not None
+    try:
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+    except OSError as e:
+        print(f"Error: cannot start engine: {exe}: {e}", file=sys.stderr)
+        sys.exit(1)
+    if proc.stdin is None or proc.stdout is None:
+        print(f"Error: cannot connect to engine stdio: {exe}", file=sys.stderr)
+        proc.kill()
+        proc.wait()
+        sys.exit(1)
     proc.stdin.write("uci\n")
     proc.stdin.write(f"setoption name Threads value {threads}\n")
     proc.stdin.write("setoption name Hash value 256\n")
