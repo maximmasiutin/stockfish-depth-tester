@@ -75,6 +75,11 @@ Save output (.txt, .csv, or .json auto-detected from extension):
       SelDepth: min=  8  max= 78  mean= 33.5  median= 46.0
 ```
 
+## Terminology
+
+- **Depth**: The nominal search depth completed by the engine (number of plies searched in iterative deepening).
+- **SelDepth** (Selective Depth): The maximum ply reached in any single line during the search, including extensions (checks, singular moves) and quiescence search. SelDepth is always >= Depth because some lines are explored deeper than others. For example, `depth 20 seldepth 35` means the engine completed depth 20, but the deepest variation explored reached ply 35.
+
 ## Method
 
 Uses `go movetime` with time calculated as `(base + 60 * inc) / 60 * 1000` ms,
@@ -84,4 +89,27 @@ move that Stockfish would use under real game conditions with the given TC.
 Without `--book`, uses 12 built-in middlegame positions from the Stockfish bench
 set (trivial endgames excluded). With `--book`, samples random positions from
 the provided EPD file.
+
+## Requirements
+
+- Python 3.12+ (stdlib only, no external dependencies)
+- Stockfish executable
+- Cross-platform: Windows, Linux, macOS without modification
+
+## Architecture
+
+- Single-file script with typed helpers
+- `Position = tuple[str, str]` (label, FEN)
+- `Config = dict[str, Any]` (label, threads, base, inc)
+- One Stockfish process per position (isolated, no state leakage)
+- Output formats: text (console), CSV, JSON
+
+## Code Quality
+
+- Python 3.12+ syntax (use `X | Y` union types, not `Optional[X]`)
+- Type annotations on all function signatures
+- Run `mypy --strict measure_depth_at_tc.py` before committing
+- Run `pylint measure_depth_at_tc.py` before committing
+- Use `subprocess.run` for one-shot commands, `subprocess.Popen` for interactive I/O
+- Graceful fallbacks when OS-specific detection fails (CPU info, paths)
 
