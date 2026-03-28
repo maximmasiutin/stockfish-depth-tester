@@ -75,6 +75,11 @@ Save output (.txt, .csv, or .json auto-detected from extension):
       SelDepth: min=  8  max= 78  mean= 33.5  median= 46.0
 ```
 
+## Terminology
+
+- **Depth**: The nominal search depth completed by the engine (number of full plies searched in iterative deepening).
+- **SelDepth** (Selective Depth): The maximum ply reached in any single line during the search, including extensions (checks, singular moves) and quiescence search. SelDepth is always >= Depth because some lines are explored deeper than others. For example, `depth 20 seldepth 35` means the engine completed depth 20, but the deepest variation explored reached ply 35.
+
 ## Method
 
 Uses `go movetime` with time calculated as `(base + 60 * inc) / 60 * 1000` ms,
