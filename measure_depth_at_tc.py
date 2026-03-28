@@ -55,16 +55,23 @@ DEFAULT_EXE = "stockfish.exe" if sys.platform == "win32" else "./stockfish"
 
 
 def _validate_executable(path: str) -> None:
-    """Validate that path points to an existing file. Prevents command injection."""
-    resolved = pathlib.Path(path).resolve()
+    """Validate that path points to a real executable. Supports PATH lookup."""
+    found = shutil.which(path)
+    if found is None:
+        print(f"Error: executable not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    resolved = pathlib.Path(found).resolve(strict=True)
     if not resolved.is_file():
-        print(f"Error: executable not found: {resolved}", file=sys.stderr)
+        print(f"Error: not a file: {resolved}", file=sys.stderr)
         sys.exit(1)
 
 
 def _validate_output_path(path: str) -> None:
     """Validate that output path parent directory exists. Prevents path traversal."""
-    resolved = pathlib.Path(path).resolve()
+    resolved = pathlib.Path(path).resolve(strict=False)
+    if resolved.is_dir():
+        print(f"Error: output path is a directory: {resolved}", file=sys.stderr)
+        sys.exit(1)
     if not resolved.parent.is_dir():
         print(f"Error: output directory does not exist: {resolved.parent}",
               file=sys.stderr)
@@ -189,12 +196,6 @@ def load_book_positions(
 
 def _validate_engine(exe: str) -> None:
     """Check that the engine executable exists and responds to UCI."""
-    if not shutil.which(exe):
-        if os.path.isfile(exe):
-            print(f"Error: engine is not executable: {exe}", file=sys.stderr)
-        else:
-            print(f"Error: engine not found: {exe}", file=sys.stderr)
-        sys.exit(1)
     _validate_executable(exe)
     try:
         with subprocess.Popen(
@@ -230,7 +231,6 @@ def _run_single_position(
 ) -> tuple[int, int]:
     """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
     timeout_s = max(30, movetime_ms // 1000 * 5)
-    _validate_executable(exe)
     try:
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -375,7 +375,6 @@ def save_csv(all_results: list[ResultDict | None], path: str) -> None:
         if r is None:
             continue
         rows.append({k: r[k] for k in fieldnames})
-    _validate_output_path(path)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -384,7 +383,6 @@ def save_csv(all_results: list[ResultDict | None], path: str) -> None:
 
 def save_json(all_results: list[ResultDict | None], path: str) -> None:
     """Save full results to a JSON file."""
-    _validate_output_path(path)
     data = [r for r in all_results if r is not None]
     with open(path, "w", newline="\n", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -539,7 +537,6 @@ def main() -> None:
 
     configs = _build_configs(parser, args)
 
-    _validate_executable(args.exe)
     _validate_engine(args.exe)
 
     max_threads_used = max(cfg["threads"] for cfg in configs)
