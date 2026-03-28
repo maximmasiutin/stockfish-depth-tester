@@ -77,7 +77,7 @@ Save output (.txt, .csv, or .json auto-detected from extension):
 
 ## Terminology
 
-- **Depth**: The nominal search depth completed by the engine (number of full plies searched in iterative deepening).
+- **Depth**: The nominal search depth completed by the engine (number of plies searched in iterative deepening).
 - **SelDepth** (Selective Depth): The maximum ply reached in any single line during the search, including extensions (checks, singular moves) and quiescence search. SelDepth is always >= Depth because some lines are explored deeper than others. For example, `depth 20 seldepth 35` means the engine completed depth 20, but the deepest variation explored reached ply 35.
 
 ## Method
