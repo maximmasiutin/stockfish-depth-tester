@@ -90,3 +90,26 @@ Without `--book`, uses 12 built-in middlegame positions from the Stockfish bench
 set (trivial endgames excluded). With `--book`, samples random positions from
 the provided EPD file.
 
+## Requirements
+
+- Python 3.12+ (stdlib only, no external dependencies)
+- Stockfish executable
+- Cross-platform: Windows, Linux, macOS without modification
+
+## Architecture
+
+- Single-file script with typed helpers
+- `Position = tuple[str, str]` (label, FEN)
+- `Config = dict[str, Any]` (label, threads, base, inc)
+- One Stockfish process per position (isolated, no state leakage)
+- Output formats: text (console), CSV, JSON
+
+## Code Quality
+
+- Python 3.12+ syntax (use `X | Y` union types, not `Optional[X]`)
+- Type annotations on all function signatures
+- Run `mypy --strict measure_depth_at_tc.py` before committing
+- Run `pylint measure_depth_at_tc.py` before committing
+- Use `subprocess.run` for one-shot commands, `subprocess.Popen` for interactive I/O
+- Graceful fallbacks when OS-specific detection fails (CPU info, paths)
+
