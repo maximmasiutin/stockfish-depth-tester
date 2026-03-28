@@ -40,6 +40,7 @@ import functools
 import io
 import json
 import os
+import pathlib
 import platform
 import random
 import re
@@ -51,6 +52,30 @@ import time
 from typing import Any
 
 DEFAULT_EXE = "stockfish.exe" if sys.platform == "win32" else "./stockfish"
+
+
+def _validate_executable(path: str) -> None:
+    """Validate that path points to a real executable. Supports PATH lookup."""
+    found = shutil.which(path)
+    if found is None:
+        print(f"Error: executable not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    resolved = pathlib.Path(found).resolve(strict=True)
+    if not resolved.is_file():
+        print(f"Error: not a file: {resolved}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _validate_output_path(path: str) -> None:
+    """Validate that output path parent directory exists. Prevents path traversal."""
+    resolved = pathlib.Path(path).resolve(strict=False)
+    if resolved.is_dir():
+        print(f"Error: output path is a directory: {resolved}", file=sys.stderr)
+        sys.exit(1)
+    if not resolved.parent.is_dir():
+        print(f"Error: output directory does not exist: {resolved.parent}",
+              file=sys.stderr)
+        sys.exit(1)
 
 Position = tuple[str, str]
 Config = dict[str, Any]
@@ -171,12 +196,7 @@ def load_book_positions(
 
 def _validate_engine(exe: str) -> None:
     """Check that the engine executable exists and responds to UCI."""
-    if not shutil.which(exe):
-        if os.path.isfile(exe):
-            print(f"Error: engine is not executable: {exe}", file=sys.stderr)
-        else:
-            print(f"Error: engine not found: {exe}", file=sys.stderr)
-        sys.exit(1)
+    _validate_executable(exe)
     try:
         with subprocess.Popen(
             [exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -468,6 +488,7 @@ def _save_output(
     all_results: list[ResultDict | None], path: str, full_log: str
 ) -> None:
     """Save results to file, format auto-detected from extension."""
+    _validate_output_path(path)
     ext = os.path.splitext(path)[1].lower()
     if ext == ".csv":
         save_csv(all_results, path)
