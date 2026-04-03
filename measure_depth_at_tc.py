@@ -106,7 +106,7 @@ STANDARD_CONFIGS: list[Config] = [
     {"label": "LTC SMP (20+0.2, 8T)",  "threads": 8, "base": 20, "inc": 0.2},
 ]
 
-AVG_MOVES = 60
+DEFAULT_AVG_MOVES = 25
 MAX_DEFAULT_THREADS = 8
 
 
@@ -227,9 +227,15 @@ def _validate_engine(exe: str) -> None:
 
 
 def _run_single_position(
-    exe: str, fen: str, threads: int, movetime_ms: int
-) -> tuple[int, int]:
-    """Run one position in a fresh Stockfish process. Returns (depth, seldepth)."""
+    exe: str, fen: str, threads: int, movetime_ms: int,
+    collect_all_depths: bool = False,
+) -> tuple[int, int, list[int]]:
+    """Run one position in a fresh Stockfish process.
+
+    Returns (final_depth, final_seldepth, all_depths).
+    all_depths is non-empty only when collect_all_depths is True;
+    it contains every completed depth reported by 'info depth N'.
+    """
     timeout_s = max(30, movetime_ms // 1000 * 5)
     try:
         proc = subprocess.Popen(  # pylint: disable=consider-using-with
@@ -252,6 +258,7 @@ def _run_single_position(
     proc.stdin.flush()
     last_depth = 0
     last_seldepth = 0
+    all_depths: list[int] = []
     deadline = time.time() + timeout_s
     for line in proc.stdout:
         if time.time() > deadline:
@@ -261,6 +268,8 @@ def _run_single_position(
         if m:
             last_depth = int(m.group(1))
             last_seldepth = int(m.group(2))
+            if collect_all_depths:
+                all_depths.append(last_depth)
         if line.startswith("bestmove"):
             break
     try:
@@ -273,24 +282,35 @@ def _run_single_position(
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    return last_depth, last_seldepth
+    return last_depth, last_seldepth, all_depths
 
 
 def run_config(
-    exe: str, cfg: Config, positions: list[Position]
-) -> tuple[list[int], list[int], int]:
-    """Run Stockfish on each position in a separate process."""
-    total_time = cfg["base"] + AVG_MOVES * cfg["inc"]
-    movetime_ms = int(total_time / AVG_MOVES * 1000)
+    exe: str, cfg: Config, positions: list[Position],
+    collect_all_depths: bool = False,
+    avg_moves: int = DEFAULT_AVG_MOVES,
+) -> tuple[list[int], list[int], int, dict[int, int]]:
+    """Run Stockfish on each position in a separate process.
+
+    Returns (depths, seldepths, movetime_ms, depth_histogram).
+    depth_histogram maps depth -> count across all positions (empty if
+    collect_all_depths is False).
+    """
+    total_time = cfg["base"] + avg_moves * cfg["inc"]
+    movetime_ms = int(total_time / avg_moves * 1000)
     threads: int = cfg["threads"]
 
     depths: list[int] = []
     seldepths: list[int] = []
+    depth_histogram: dict[int, int] = {}
     for _label, fen in positions:
-        d, sd = _run_single_position(exe, fen, threads, movetime_ms)
+        d, sd, all_d = _run_single_position(
+            exe, fen, threads, movetime_ms, collect_all_depths)
         depths.append(d)
         seldepths.append(sd)
-    return depths, seldepths, movetime_ms
+        for dd in all_d:
+            depth_histogram[dd] = depth_histogram.get(dd, 0) + 1
+    return depths, seldepths, movetime_ms, depth_histogram
 
 
 def format_results(
@@ -299,6 +319,7 @@ def format_results(
     seldepths: list[int],
     movetime_ms: int,
     positions: list[Position],
+    depth_histogram: dict[int, int] | None = None,
 ) -> ResultDict | None:
     """Return dict with all results for one config."""
     if not depths:
@@ -307,7 +328,7 @@ def format_results(
     for i, (d, sd) in enumerate(zip(depths, seldepths, strict=True)):
         name = positions[i][0] if i < len(positions) else str(i + 1)
         per_position.append({"position": name, "depth": d, "seldepth": sd})
-    return {
+    result: ResultDict = {
         "label": cfg["label"],
         "threads": cfg["threads"],
         "base": cfg["base"],
@@ -324,6 +345,15 @@ def format_results(
         "seldepth_median": round(statistics.median(seldepths), 1),
         "per_position": per_position,
     }
+    if depth_histogram:
+        total = sum(depth_histogram.values())
+        sorted_hist = []
+        for d in sorted(depth_histogram):
+            count = depth_histogram[d]
+            pct = round(100.0 * count / total, 2) if total > 0 else 0.0
+            sorted_hist.append({"depth": d, "count": count, "pct": pct})
+        result["depth_histogram"] = sorted_hist
+    return result
 
 
 def print_results(all_results: list[ResultDict | None]) -> None:
@@ -349,6 +379,16 @@ def print_results(all_results: list[ResultDict | None]) -> None:
         print(f"  SelDepth: min={r['seldepth_min']:>3}  max={r['seldepth_max']:>3}  "
               f"mean={r['seldepth_mean']:>5.1f}  median={r['seldepth_median']:>5.1f}")
         print()
+        if "depth_histogram" in r:
+            print("  Depth distribution (all completed iterations):")
+            print(f"  {'Depth':>5} {'Count':>7} {'Pct':>7}  Bar")
+            print(f"  {'-' * 5} {'-' * 7} {'-' * 7}  {'-' * 40}")
+            max_count = max(h["count"] for h in r["depth_histogram"])
+            for h in r["depth_histogram"]:
+                bar_len = int(40 * h["count"] / max_count) if max_count > 0 else 0
+                print(f"  {h['depth']:>5} {h['count']:>7} {h['pct']:>6.1f}%  "
+                      f"{'#' * bar_len}")
+            print()
 
     # Summary table
     print("=== Summary: Mean Depth ===")
@@ -468,7 +508,7 @@ def _capture_full_output(
             print(f"Seed: {args.seed}")
         if book_line_numbers:
             print(f"Book lines: {', '.join(str(n) for n in book_line_numbers)}")
-        print(f"Assumed average game length: {AVG_MOVES} moves")
+        print(f"Assumed average game length: {args.avg_moves} moves")
         print()
         for r in all_results:
             if r is None:
@@ -520,10 +560,16 @@ def main() -> None:
                         help="Random seed for book sampling (for reproducibility)")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Save output to file (.txt, .csv, or .json)")
+    parser.add_argument("--depth-histogram", action="store_true", default=False,
+                        help="Record and display depth distribution histogram")
+    parser.add_argument("--avg-moves", type=int, default=DEFAULT_AVG_MOVES,
+                        help=f"Assumed average game length in moves (default: {DEFAULT_AVG_MOVES})")
     args = parser.parse_args()
 
     if args.num_positions < 1:
         parser.error("--num-positions must be at least 1")
+    if args.avg_moves < 1 or args.avg_moves > 500:
+        parser.error("--avg-moves must be between 1 and 500")
 
     positions: list[Position]
     book_line_numbers: list[int] = []
@@ -548,14 +594,16 @@ def main() -> None:
         print(f"Seed: {args.seed}")
     if book_line_numbers:
         print(f"Book lines: {', '.join(str(n) for n in book_line_numbers)}")
-    print(f"Assumed average game length: {AVG_MOVES} moves")
+    print(f"Assumed average game length: {args.avg_moves} moves")
     print()
 
     all_results: list[ResultDict | None] = []
     for cfg in configs:
         print(f"Running {cfg['label']} ...", flush=True)
-        depths, seldepths, movetime_ms = run_config(args.exe, cfg, positions)
-        r = format_results(cfg, depths, seldepths, movetime_ms, positions)
+        depths, seldepths, movetime_ms, depth_hist = run_config(
+            args.exe, cfg, positions, args.depth_histogram, args.avg_moves)
+        r = format_results(cfg, depths, seldepths, movetime_ms, positions,
+                           depth_hist if args.depth_histogram else None)
         all_results.append(r)
         if r is None:
             print("  NO DATA")
