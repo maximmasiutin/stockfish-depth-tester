@@ -515,6 +515,7 @@ def _capture_full_output(
                 print("NO DATA")
             else:
                 print(f"Running {r['label']} ...")
+                print(f"  Time budget per position: {r['movetime_ms']}ms")
                 print(f"  median depth={r['depth_median']:.1f}, "
                       f"seldepth={r['seldepth_median']:.1f}")
         print()
@@ -602,6 +603,7 @@ def main() -> None:
         print(f"Running {cfg['label']} ...", flush=True)
         depths, seldepths, movetime_ms, depth_hist = run_config(
             args.exe, cfg, positions, args.depth_histogram, args.avg_moves)
+        print(f"  Time budget per position: {movetime_ms}ms")
         r = format_results(cfg, depths, seldepths, movetime_ms, positions,
                            depth_hist if args.depth_histogram else None)
         all_results.append(r)
