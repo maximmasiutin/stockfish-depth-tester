@@ -106,7 +106,7 @@ STANDARD_CONFIGS: list[Config] = [
     {"label": "LTC SMP (20+0.2, 8T)",  "threads": 8, "base": 20, "inc": 0.2},
 ]
 
-DEFAULT_AVG_MOVES = 25
+DEFAULT_AVG_MOVES = 65
 MAX_DEFAULT_THREADS = 8
 
 
